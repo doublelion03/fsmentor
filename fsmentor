@@ -1,0 +1,916 @@
+#!/usr/bin/env python3
+"""
+fsmentor - File System Mentor
+Educational CLI helper for Linux filesystem hierarchy and Debian package management.
+Designed for beginners and professionals on Debian/Ubuntu/Kali and similar systems.
+
+Zero external dependencies. Instant. No history storage.
+
+A full conversational AI agent version is planned for a later release.
+This CLI stays lightweight and educational.
+
+Usage examples:
+  fsmentor                     # Friendly overview
+  fsmentor fhs                 # Full FHS explanation
+  fsmentor path /usr/bin       # Explain a path
+  fsmentor cmd ls              # Explain a command (enhanced which)
+  fsmentor pkg nginx           # Explain a package
+  fsmentor install htop        # Explain then offer to install
+  fsmentor search python3      # Search packages
+  fsmentor owner /usr/bin/ls   # Which package owns this file?
+  fsmentor why /var/log        # Quick “why is this here?”
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+# ANSI colors
+class C:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    WHITE = "\033[37m"
+    BG_BLUE = "\033[44m"
+
+def color(text, *codes):
+    if not sys.stdout.isatty():
+        return text
+    return "".join(codes) + str(text) + C.RESET
+
+def header(title):
+    print()
+    print(color("═" * 64, C.CYAN))
+    print(color(f"  {title}", C.BOLD + C.CYAN))
+    print(color("═" * 64, C.CYAN))
+    print()
+
+def section(title):
+    print(color(f"▶ {title}", C.BOLD + C.YELLOW))
+    print()
+
+def info(label, value):
+    print(f"  {color(label + ':', C.DIM)} {value}")
+
+def tip(msg):
+    print(color(f"  💡 {msg}", C.GREEN))
+
+def warn(msg):
+    print(color(f"  ⚠  {msg}", C.YELLOW))
+
+def run(cmd, capture=True, check=False):
+    try:
+        if capture:
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=30
+            )
+            return result.stdout.strip(), result.returncode
+        else:
+            return subprocess.run(cmd, shell=True, timeout=60).returncode
+    except Exception as e:
+        return str(e), 1
+
+# ---------------------------------------------------------------------------
+# FHS Knowledge Base
+# ---------------------------------------------------------------------------
+
+FHS = {
+    "/": {
+        "name": "Root",
+        "purpose": "The top of the entire filesystem tree. Everything starts here.",
+        "details": (
+            "Unlike Windows (which uses drive letters C:, D:, etc.), Linux has a single "
+            "unified tree. All disks, USB drives, and network shares are mounted somewhere "
+            "under this root. You almost never put ordinary files directly in /."
+        ),
+        "examples": ["All directories and files ultimately live under /"],
+    },
+    "/bin": {
+        "name": "Essential User Binaries",
+        "purpose": "Critical commands needed by all users, even in single-user/recovery mode.",
+        "details": (
+            "Historically contained the most essential programs (ls, cp, mv, cat, bash…). "
+            "On modern Debian/Ubuntu/Kali systems, /bin is usually a symlink to /usr/bin. "
+            "These binaries must be available even if /usr is not yet mounted."
+        ),
+        "examples": ["ls, cp, mv, cat, echo, bash, dash"],
+    },
+    "/sbin": {
+        "name": "Essential System Binaries",
+        "purpose": "Critical system administration tools (mostly for root).",
+        "details": (
+            "Commands needed to boot, repair, and administer the system. "
+            "Often requires root privileges. On modern systems this is frequently a "
+            "symlink to /usr/sbin."
+        ),
+        "examples": ["fdisk, ifconfig, iptables, reboot, fsck, ip"],
+    },
+    "/usr": {
+        "name": "User Programs & Data (Unix System Resources)",
+        "purpose": "The main location for almost all installed software managed by the package manager.",
+        "details": (
+            "Think of /usr as the 'program files' of Linux. Most applications installed "
+            "via apt go under /usr. It is meant to be shareable and read-only in many "
+            "server setups. Subdirectories: bin, sbin, lib, share, local, etc."
+        ),
+        "examples": ["/usr/bin, /usr/lib, /usr/share, /usr/local"],
+    },
+    "/usr/bin": {
+        "name": "User Binaries",
+        "purpose": "Executables for normal users — the majority of commands you run daily.",
+        "details": (
+            "This is where almost all user-facing programs live after an apt install. "
+            "When you type a command and the shell finds it, it is usually here "
+            "(or in /bin which often points here). This is why 'which command' often "
+            "returns /usr/bin/command."
+        ),
+        "examples": ["python3, gcc, git, nano, vim, htop, curl, wget"],
+    },
+    "/usr/sbin": {
+        "name": "System Administration Binaries",
+        "purpose": "Non-essential system tools (still mostly for administrators).",
+        "details": (
+            "More advanced admin tools that are not required for basic boot/recovery. "
+            "Examples: service management helpers, network tools, package helpers."
+        ),
+        "examples": ["adduser, useradd, nginx, apache2, ss, tcpdump"],
+    },
+    "/usr/local": {
+        "name": "Locally Installed Software",
+        "purpose": "Software you compile yourself or install outside the package manager.",
+        "details": (
+            "The package manager (apt/dpkg) never touches files under /usr/local. "
+            "This is the safe place for custom builds, scripts, or third-party tools "
+            "you install manually. Structure mirrors /usr (bin, lib, share…)."
+        ),
+        "examples": ["/usr/local/bin, /usr/local/lib, /usr/local/src"],
+    },
+    "/usr/share": {
+        "name": "Architecture-Independent Data",
+        "purpose": "Shared data that does not depend on CPU architecture (docs, icons, man pages, etc.).",
+        "details": (
+            "Man pages, documentation, icons, fonts, locale data, and application "
+            "resources live here. Very useful when you want to read documentation: "
+            "look in /usr/share/doc/<package>."
+        ),
+        "examples": ["/usr/share/man, /usr/share/doc, /usr/share/icons"],
+    },
+    "/etc": {
+        "name": "Host-Specific Configuration",
+        "purpose": "System-wide configuration files. The 'control panel' of the machine.",
+        "details": (
+            "Almost every program stores its default configuration under /etc. "
+            "When you change how a service behaves, you almost always edit something "
+            "here. Configurations are text files so they are easy to version-control "
+            "and understand. Never put binaries here."
+        ),
+        "examples": ["/etc/passwd, /etc/fstab, /etc/apt, /etc/nginx, /etc/ssh"],
+    },
+    "/etc/apt": {
+        "name": "APT Package Manager Configuration",
+        "purpose": "Controls where packages come from and how apt behaves.",
+        "details": (
+            "sources.list and sources.list.d/ define the repositories. "
+            "preferences, apt.conf.d/ control pinning, proxies, and behavior. "
+            "This is the brain of package management on Debian-based systems."
+        ),
+        "examples": ["sources.list, sources.list.d/, apt.conf.d/"],
+    },
+    "/home": {
+        "name": "User Home Directories",
+        "purpose": "Personal files and settings for each normal user.",
+        "details": (
+            "Each user gets a directory like /home/alice. This is where documents, "
+            "downloads, desktop files, and personal configuration (dotfiles like "
+            ".bashrc, .config/) live. Root's home is special: /root."
+        ),
+        "examples": ["/home/username, ~/.config, ~/.local"],
+    },
+    "/root": {
+        "name": "Root User's Home",
+        "purpose": "Home directory of the superuser (root).",
+        "details": (
+            "Separated from /home for security and so that root can still work "
+            "even if /home is on a different (possibly unavailable) partition."
+        ),
+        "examples": ["/root/.bashrc, /root/.ssh"],
+    },
+    "/var": {
+        "name": "Variable Data",
+        "purpose": "Files that change size or content during normal system operation.",
+        "details": (
+            "Logs, caches, databases, spools, and runtime data. Unlike /usr "
+            "(mostly static after install), /var grows and shrinks. "
+            "This is why /var is often put on its own partition."
+        ),
+        "examples": ["/var/log, /var/lib, /var/cache, /var/spool"],
+    },
+    "/var/log": {
+        "name": "System & Application Logs",
+        "purpose": "Where almost all programs write their log files.",
+        "details": (
+            "When something breaks, start here. Common files: syslog, auth.log, "
+            "kern.log, and per-application directories. On modern systems many "
+            "logs also go through journald (journalctl)."
+        ),
+        "examples": ["syslog, auth.log, nginx/, apache2/, journal/"],
+    },
+    "/var/lib": {
+        "name": "Persistent Application State",
+        "purpose": "Data that programs need to keep between reboots (databases, package state, etc.).",
+        "details": (
+            "dpkg stores its database here (/var/lib/dpkg). Databases, Docker "
+            "volumes, package lists, and similar long-lived data live under /var/lib."
+        ),
+        "examples": ["/var/lib/dpkg, /var/lib/apt, /var/lib/docker"],
+    },
+    "/var/cache": {
+        "name": "Application Caches",
+        "purpose": "Temporary data that can be regenerated if deleted.",
+        "details": (
+            "apt stores downloaded .deb files in /var/cache/apt/archives. "
+            "Safe to clean when disk space is low (apt clean / apt autoclean)."
+        ),
+        "examples": ["/var/cache/apt, /var/cache/fontconfig"],
+    },
+    "/tmp": {
+        "name": "Temporary Files",
+        "purpose": "Short-lived files that programs create and then delete.",
+        "details": (
+            "Usually cleared on reboot. Anyone can write here. Do not store "
+            "important data in /tmp — it can disappear."
+        ),
+        "examples": ["Temporary downloads, sockets, lock files"],
+    },
+    "/opt": {
+        "name": "Optional / Third-Party Software",
+        "purpose": "Self-contained third-party applications (often proprietary or large suites).",
+        "details": (
+            "Each application usually gets its own subdirectory (/opt/google, "
+            "/opt/firefox…). Configuration may go in /etc/opt and variable data "
+            "in /var/opt. Less common on pure Debian systems that prefer apt."
+        ),
+        "examples": ["/opt/google/chrome, /opt/microsoft"],
+    },
+    "/boot": {
+        "name": "Boot Loader Files",
+        "purpose": "Kernel images, initramfs, and bootloader configuration.",
+        "details": (
+            "Critical for the system to start. Old kernels accumulate here and can "
+            "fill the partition — clean them with 'sudo apt autoremove'."
+        ),
+        "examples": ["vmlinuz-*, initrd.img-*, grub/"],
+    },
+    "/dev": {
+        "name": "Device Files",
+        "purpose": "Special files that represent hardware devices.",
+        "details": (
+            "Everything is a file in Linux — including hard disks (/dev/sda), "
+            "terminals (/dev/tty), null device (/dev/null), etc. These are not "
+            "real files on disk; the kernel creates them."
+        ),
+        "examples": ["/dev/sda, /dev/null, /dev/tty, /dev/random"],
+    },
+    "/proc": {
+        "name": "Process & Kernel Information",
+        "purpose": "Virtual filesystem exposing kernel and process information.",
+        "details": (
+            "Not real files on disk. /proc/cpuinfo, /proc/meminfo, /proc/<pid>/ "
+            "give live information about the running system. Extremely useful for "
+            "troubleshooting and monitoring."
+        ),
+        "examples": ["/proc/cpuinfo, /proc/meminfo, /proc/1/"],
+    },
+    "/sys": {
+        "name": "Sysfs - Kernel Device Tree",
+        "purpose": "Virtual filesystem for kernel objects, devices, and drivers.",
+        "details": (
+            "Modern way to interact with hardware and kernel parameters. "
+            "Used by udev and many system tools."
+        ),
+        "examples": ["/sys/class, /sys/devices, /sys/fs"],
+    },
+    "/lib": {
+        "name": "Essential Shared Libraries",
+        "purpose": "Libraries needed by the essential binaries in /bin and /sbin.",
+        "details": (
+            "On modern Debian systems this is usually a symlink to /usr/lib "
+            "or /usr/lib/<arch>. Contains the C library and other core libraries."
+        ),
+        "examples": ["libc.so, ld-linux.so"],
+    },
+    "/media": {
+        "name": "Removable Media Mount Points",
+        "purpose": "Where USB drives, CDs, and other removable devices are automatically mounted.",
+        "details": "Desktop environments and udisks usually create subdirectories here.",
+        "examples": ["/media/username/USB_DRIVE"],
+    },
+    "/mnt": {
+        "name": "Temporary Mount Point",
+        "purpose": "Classic place for temporarily mounting filesystems by hand.",
+        "details": "You often do 'sudo mount /dev/sdb1 /mnt' when exploring a disk.",
+        "examples": ["/mnt"],
+    },
+    "/run": {
+        "name": "Runtime Data",
+        "purpose": "Volatile data for the current boot (PIDs, sockets, locks).",
+        "details": (
+            "Lives in RAM (tmpfs). Cleared on every reboot. Replaces older "
+            "locations like /var/run."
+        ),
+        "examples": ["/run/systemd, /run/user/1000"],
+    },
+    "/srv": {
+        "name": "Service Data",
+        "purpose": "Data for services provided by this system (web, ftp, etc.).",
+        "details": "Optional; many admins still put web roots under /var/www instead.",
+        "examples": ["/srv/www, /srv/ftp"],
+    },
+}
+
+# Common path prefixes for smarter matching
+PATH_ALIASES = {
+    "/usr/bin": "/usr/bin",
+    "/bin": "/bin",
+    "/usr/sbin": "/usr/sbin",
+    "/sbin": "/sbin",
+    "/usr/local/bin": "/usr/local",
+    "/usr/local": "/usr/local",
+    "/etc": "/etc",
+    "/var/log": "/var/log",
+    "/var/lib": "/var/lib",
+    "/var/cache": "/var/cache",
+    "/var": "/var",
+    "/home": "/home",
+    "/opt": "/opt",
+    "/boot": "/boot",
+    "/dev": "/dev",
+    "/proc": "/proc",
+    "/sys": "/sys",
+    "/tmp": "/tmp",
+    "/lib": "/lib",
+    "/usr/share": "/usr/share",
+    "/usr": "/usr",
+    "/run": "/run",
+    "/srv": "/srv",
+    "/media": "/media",
+    "/mnt": "/mnt",
+    "/root": "/root",
+}
+
+def find_fhs_entry(path: str):
+    """Find the best matching FHS entry for a path."""
+    path = os.path.normpath(path)
+    if not path.startswith("/"):
+        path = "/" + path
+
+    # Exact match first
+    if path in FHS:
+        return path, FHS[path]
+
+    # Longest prefix match
+    best = None
+    best_len = -1
+    for key in FHS:
+        if path.startswith(key.rstrip("/") + "/") or path == key:
+            if len(key) > best_len:
+                best = key
+                best_len = len(key)
+    if best:
+        return best, FHS[best]
+
+    # Try parent directories
+    p = Path(path)
+    while str(p) != "/":
+        p = p.parent
+        if str(p) in FHS:
+            return str(p), FHS[str(p)]
+    return "/", FHS["/"]
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_fhs(args):
+    header("Filesystem Hierarchy Standard (FHS) — Quick Map")
+    print(
+        textwrap.fill(
+            "Linux organizes files by purpose, not by program. Understanding this map "
+            "makes troubleshooting, package management, and system administration far easier.",
+            width=70,
+        )
+    )
+    print()
+
+    groups = [
+        ("Core / Boot", ["/", "/boot", "/dev", "/proc", "/sys", "/run"]),
+        ("Essential Binaries & Libraries", ["/bin", "/sbin", "/lib"]),
+        ("Installed Software", ["/usr", "/usr/bin", "/usr/sbin", "/usr/share", "/usr/local"]),
+        ("Configuration", ["/etc", "/etc/apt"]),
+        ("User Data", ["/home", "/root"]),
+        ("Variable / Changing Data", ["/var", "/var/log", "/var/lib", "/var/cache", "/tmp"]),
+        ("Optional / Mounts", ["/opt", "/media", "/mnt", "/srv"]),
+    ]
+
+    for group_name, keys in groups:
+        section(group_name)
+        for key in keys:
+            entry = FHS[key]
+            print(f"  {color(key, C.BOLD + C.CYAN):<18} {entry['purpose']}")
+        print()
+
+    tip("Use 'fsmentor path <directory>' for a deeper explanation of any location.")
+    tip("Use 'fsmentor cmd <command>' or 'fsmentor pkg <package>' for real examples.")
+
+def cmd_path(args):
+    path = args.path
+    if not path.startswith("/"):
+        # Try to resolve relative or command-like input
+        which_out, _ = run(f"which {path} 2>/dev/null")
+        if which_out:
+            path = which_out.splitlines()[0]
+        else:
+            path = os.path.abspath(path)
+
+    key, entry = find_fhs_entry(path)
+
+    header(f"Path Explanation: {path}")
+
+    info("Matched FHS location", color(key, C.BOLD + C.CYAN))
+    info("Name", entry["name"])
+    print()
+    section("Purpose")
+    print(textwrap.fill(entry["purpose"], width=70, initial_indent="  ", subsequent_indent="  "))
+    print()
+    section("Details")
+    print(textwrap.fill(entry["details"], width=70, initial_indent="  ", subsequent_indent="  "))
+    print()
+    if entry.get("examples"):
+        section("Typical contents / examples")
+        for ex in entry["examples"]:
+            print(f"  • {ex}")
+        print()
+
+    # Extra live information
+    if os.path.exists(path):
+        section("Live information on this system")
+        if os.path.islink(path):
+            target = os.readlink(path)
+            info("Symbolic link →", color(target, C.YELLOW))
+        if os.path.isdir(path):
+            try:
+                count = len(os.listdir(path))
+                info("Entries in directory", str(count))
+            except PermissionError:
+                info("Entries in directory", "(permission denied)")
+        # Ownership
+        try:
+            st = os.stat(path)
+            import pwd, grp
+            owner = pwd.getpwuid(st.st_uid).pw_name
+            group = grp.getgrgid(st.st_gid).gr_name
+            info("Owner : Group", f"{owner} : {group}")
+        except Exception:
+            pass
+    else:
+        warn(f"Path does not currently exist on this system: {path}")
+
+    print()
+    tip("Related: fsmentor fhs  |  fsmentor cmd <name>  |  fsmentor pkg <name>")
+
+def cmd_cmd(args):
+    name = args.name
+    header(f"Command / Binary Explanation: {name}")
+
+    # which
+    which_out, rc = run(f"which {name} 2>/dev/null")
+    type_out, _ = run(f"bash -c 'type -a {name}' 2>/dev/null")
+    whereis_out, _ = run(f"whereis -b {name} 2>/dev/null")
+
+    if which_out:
+        binary = which_out.splitlines()[0]
+        info("Found executable", color(binary, C.GREEN + C.BOLD))
+    else:
+        binary = None
+        warn(f"'{name}' not found in your $PATH")
+        print()
+
+    if type_out:
+        section("Shell view (type -a)")
+        for line in type_out.splitlines():
+            print(f"  {line}")
+        print()
+
+    if whereis_out:
+        section("whereis")
+        print(f"  {whereis_out}")
+        print()
+
+    if binary:
+        # Explain the directory it lives in
+        key, entry = find_fhs_entry(binary)
+        section(f"Why it lives in {key}")
+        print(textwrap.fill(entry["purpose"], width=70, initial_indent="  ", subsequent_indent="  "))
+        print()
+        print(textwrap.fill(entry["details"], width=70, initial_indent="  ", subsequent_indent="  "))
+        print()
+
+        # Package ownership
+        section("Package ownership (dpkg)")
+        owner_out, rc = run(f"dpkg -S {binary} 2>/dev/null")
+        if rc == 0 and owner_out:
+            pkg = owner_out.split(":")[0].strip()
+            info("Provided by package", color(pkg, C.CYAN + C.BOLD))
+            print()
+            tip(f"Run:  fsmentor pkg {pkg}   for full package explanation")
+        else:
+            print("  Not owned by any installed dpkg package (maybe manual install, snap, or flatpak).")
+            print()
+
+        # File type
+        file_out, _ = run(f"file -b {binary} 2>/dev/null")
+        if file_out:
+            info("File type", file_out)
+
+    print()
+    tip("Try: fsmentor path /usr/bin   or   fsmentor pkg <package-name>")
+
+def get_package_info(pkg):
+    """Return dict with package information."""
+    info = {"name": pkg, "installed": False, "description": "", "files": [], "raw_show": ""}
+
+    show_out, rc = run(f"apt-cache show {pkg} 2>/dev/null")
+    if rc == 0 and show_out:
+        info["raw_show"] = show_out
+        for line in show_out.splitlines():
+            if line.startswith("Description:"):
+                info["description"] = line[len("Description:"):].strip()
+            elif line.startswith("Description-en:"):
+                info["description"] = line[len("Description-en:"):].strip()
+
+    # Is it installed?
+    status_out, rc = run(f"dpkg -s {pkg} 2>/dev/null")
+    if rc == 0 and "Status: install ok installed" in status_out:
+        info["installed"] = True
+        files_out, _ = run(f"dpkg -L {pkg} 2>/dev/null")
+        if files_out:
+            # Keep only real files (skip pure directory markers that dpkg sometimes lists)
+            raw = [f for f in files_out.splitlines() if f and f != "/" and not f.endswith("/")]
+            # Prefer entries that look like actual files (have an extension or are in bin/sbin/etc.)
+            info["files"] = raw
+
+    return info
+
+def categorize_files(files):
+    """Group package files by FHS category."""
+    cats = {
+        "binaries (/usr/bin, /bin, /usr/sbin…)": [],
+        "configuration (/etc)": [],
+        "libraries (/usr/lib, /lib)": [],
+        "documentation (/usr/share/doc, man)": [],
+        "data / state (/var)": [],
+        "other": [],
+    }
+    for f in files:
+        if any(f.startswith(p) for p in ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin")):
+            cats["binaries (/usr/bin, /bin, /usr/sbin…)"].append(f)
+        elif f.startswith("/etc"):
+            cats["configuration (/etc)"].append(f)
+        elif any(f.startswith(p) for p in ("/usr/lib", "/lib", "/usr/libexec")):
+            cats["libraries (/usr/lib, /lib)"].append(f)
+        elif any(f.startswith(p) for p in ("/usr/share/doc", "/usr/share/man", "/usr/share/info")):
+            cats["documentation (/usr/share/doc, man)"].append(f)
+        elif f.startswith("/var"):
+            cats["data / state (/var)"].append(f)
+        else:
+            cats["other"].append(f)
+    return {k: v for k, v in cats.items() if v}
+
+def cmd_pkg(args):
+    pkg = args.package
+    header(f"Package Explanation: {pkg}")
+
+    pinfo = get_package_info(pkg)
+
+    if not pinfo["raw_show"] and not pinfo["installed"]:
+        warn(f"Package '{pkg}' not found in apt cache.")
+        print()
+        tip("Try updating the cache:  sudo apt update")
+        tip("Or search:  fsmentor search " + pkg)
+        return
+
+    section("Overview")
+    info("Package", color(pkg, C.BOLD + C.CYAN))
+    info("Installed", color("Yes", C.GREEN) if pinfo["installed"] else color("No", C.YELLOW))
+    if pinfo["description"]:
+        print()
+        print(textwrap.fill(pinfo["description"], width=70, initial_indent="  ", subsequent_indent="  "))
+    print()
+
+    # Show a few key fields from apt-cache show
+    if pinfo["raw_show"]:
+        section("Key metadata (from apt-cache show)")
+        interesting = ("Package", "Version", "Priority", "Section", "Maintainer",
+                       "Installed-Size", "Depends", "Homepage", "Description")
+        for line in pinfo["raw_show"].splitlines():
+            for key in interesting:
+                if line.startswith(key + ":"):
+                    print(f"  {line}")
+                    break
+        print()
+
+    if pinfo["installed"] and pinfo["files"]:
+        section("Where the files live (FHS view)")
+        cats = categorize_files(pinfo["files"])
+        for cat, filelist in cats.items():
+            print(color(f"  {cat}", C.BOLD))
+            # Show first few + count
+            for f in filelist[:6]:
+                print(f"    • {f}")
+            if len(filelist) > 6:
+                print(f"    … and {len(filelist) - 6} more")
+            print()
+
+        tip(f"Full list:  dpkg -L {pkg}")
+        tip(f"Find which package owns a file:  dpkg -S /path/to/file")
+    elif not pinfo["installed"]:
+        section("What would be installed?")
+        print("  Package is not installed yet. After installation, files typically go to:")
+        print()
+        print("  • Binaries          → /usr/bin or /usr/sbin")
+        print("  • Configuration     → /etc/<package> or /etc/")
+        print("  • Libraries         → /usr/lib/…")
+        print("  • Documentation     → /usr/share/doc/<package>")
+        print("  • State / databases → /var/lib/<package>")
+        print()
+        tip(f"Preview files without installing:  apt-file list {pkg}  (requires apt-file)")
+        tip(f"Or install and then run:  fsmentor pkg {pkg}")
+
+    print()
+    tip("Related: fsmentor install " + pkg + "   |   fsmentor path /usr/bin")
+
+def cmd_install(args):
+    pkg = args.package
+    header(f"Install Preview: {pkg}")
+
+    pinfo = get_package_info(pkg)
+    if not pinfo["raw_show"] and not pinfo["installed"]:
+        warn(f"Package '{pkg}' was not found in the apt cache.")
+        tip("Update the package lists first:  sudo apt update")
+        tip("Then try again, or search with:  fsmentor search " + pkg)
+        return
+
+    if pinfo["installed"]:
+        warn(f"'{pkg}' is already installed on this system.")
+        tip(f"Inspect it with:  fsmentor pkg {pkg}")
+        return
+
+    # Clear statement of intent
+    section("What you are about to do")
+    print(textwrap.fill(
+        f"You are preparing to install the package '{pkg}' using apt. "
+        "This will download files from the configured repositories and place them "
+        "on your system according to the Filesystem Hierarchy Standard (FHS).",
+        width=70, initial_indent="  ", subsequent_indent="  "
+    ))
+    print()
+
+    if pinfo["description"]:
+        section("Package description")
+        print(textwrap.fill(pinfo["description"], width=70, initial_indent="  ", subsequent_indent="  "))
+        print()
+
+    section("Where files will be placed")
+    print("  Typical locations for a Debian package:")
+    print()
+    print(f"  {color('Binaries', C.CYAN):<20} → /usr/bin  or  /usr/sbin")
+    print(f"  {color('Configuration', C.CYAN):<20} → /etc/  (often /etc/{pkg}/)")
+    print(f"  {color('Libraries', C.CYAN):<20} → /usr/lib/…")
+    print(f"  {color('Documentation', C.CYAN):<20} → /usr/share/doc/{pkg}/")
+    print(f"  {color('Runtime data', C.CYAN):<20} → /var/lib/{pkg}/  (when needed)")
+    print(f"  {color('Logs', C.CYAN):<20} → /var/log/  (for service packages)")
+    print()
+
+    section("Important notes")
+    print("  • This action requires administrator privileges (sudo).")
+    print("  • Dependencies will also be installed automatically by apt.")
+    print("  • Configuration files under /etc are usually left alone on upgrades.")
+    print("  • You can remove the package later with:  sudo apt remove " + pkg)
+    print()
+
+    tip("After a successful install you can inspect the exact files with:")
+    tip("  fsmentor pkg " + pkg)
+    print()
+
+    # Strong confirmation
+    if args.yes:
+        proceed = True
+    else:
+        print(color("  ────────────────────────────────────────", C.DIM))
+        print(color("  This will modify your system.", C.YELLOW + C.BOLD))
+        print(color("  ────────────────────────────────────────", C.DIM))
+        print()
+        try:
+            answer = input(color(f"  Type 'yes' to run:  sudo apt install {pkg}   [or press Enter to cancel]: ", C.BOLD)).strip().lower()
+            proceed = answer in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            proceed = False
+
+    if proceed:
+        print()
+        section("Running installation")
+        print(f"  Executing: sudo apt install -y {pkg}")
+        print()
+        rc = run(f"sudo apt install -y {pkg}", capture=False)
+        if rc == 0:
+            print()
+            tip("Installation finished.")
+            tip("Inspect the package:  fsmentor pkg " + pkg)
+            tip("Find its main command:  fsmentor cmd " + pkg)
+        else:
+            warn("The installation command returned a non-zero exit code.")
+            tip("Check the output above for the reason.")
+    else:
+        print()
+        print("  Cancelled. No changes were made to your system.")
+        tip("You can run the real command yourself whenever you are ready:")
+        tip("  sudo apt install " + pkg)
+
+def cmd_search(args):
+    query = args.query
+    header(f"Package Search: {query}")
+
+    out, rc = run(f"apt-cache search --names-only {query} 2>/dev/null | head -30")
+    if not out:
+        warn("No packages found (or apt cache is empty).")
+        tip("Try: sudo apt update")
+        return
+
+    section("Matching packages (name only)")
+    for line in out.splitlines():
+        if " - " in line:
+            name, desc = line.split(" - ", 1)
+            print(f"  {color(name, C.CYAN + C.BOLD):<28} {desc[:60]}")
+        else:
+            print(f"  {line}")
+    print()
+    tip("Explain one of them:  fsmentor pkg <name>")
+    tip("Smart install:        fsmentor install <name>")
+
+
+def cmd_owner(args):
+    """Show which package owns a given file."""
+    path = args.file
+    header(f"Who owns this file?  {path}")
+
+    if not os.path.exists(path):
+        # Try to resolve if it looks like a command
+        which_out, _ = run(f"which {path} 2>/dev/null")
+        if which_out:
+            path = which_out.splitlines()[0]
+            info("Resolved command to", color(path, C.GREEN))
+        else:
+            warn(f"Path does not exist: {path}")
+            tip("Try an absolute path, e.g. /usr/bin/ls")
+            return
+
+    out, rc = run(f"dpkg -S {path} 2>/dev/null")
+    if rc == 0 and out:
+        # dpkg -S can return multiple lines
+        for line in out.splitlines():
+            if ":" in line:
+                pkg, fpath = line.split(":", 1)
+                info("Package", color(pkg.strip(), C.CYAN + C.BOLD))
+                info("File", fpath.strip())
+        print()
+        tip(f"Full package explanation:  fsmentor pkg {out.split(':')[0].strip()}")
+    else:
+        warn("Not owned by any installed dpkg package.")
+        print("  Possible reasons: manual install, snap, flatpak, or compiled from source.")
+        tip("Try:  fsmentor cmd " + os.path.basename(path))
+
+
+def cmd_why(args):
+    """Friendly alias: decide whether the target is a path or a command."""
+    target = args.target
+    # Heuristic: if it starts with / or looks like a path → path, else try cmd
+    if target.startswith("/") or "/" in target:
+        # Re-use path logic
+        class Fake:
+            path = target
+        cmd_path(Fake())
+    else:
+        class Fake:
+            name = target
+        cmd_cmd(Fake())
+
+
+def show_welcome():
+    """Friendly landing page when no command is given."""
+    header("fsmentor – File System Mentor")
+    print(textwrap.fill(
+        "Learn the Linux filesystem and Debian packages without memorising paths. "
+        "Every answer explains the *why*, not just the *what*.",
+        width=70
+    ))
+    print()
+    section("Available commands")
+    print(f"  {color('fsmentor fhs', C.CYAN):<32} Map of the whole filesystem")
+    print(f"  {color('fsmentor path /etc', C.CYAN):<32} Explain any directory")
+    print(f"  {color('fsmentor cmd python3', C.CYAN):<32} What is this command + who owns it")
+    print(f"  {color('fsmentor pkg nginx', C.CYAN):<32} Package details + where files live")
+    print(f"  {color('fsmentor install htop', C.CYAN):<32} Preview and safely install a package")
+    print(f"  {color('fsmentor search editor', C.CYAN):<32} Find packages by name")
+    print(f"  {color('fsmentor owner /usr/bin/ls', C.CYAN):<32} Which package owns this file?")
+    print(f"  {color('fsmentor why /var/log', C.CYAN):<32} Quick explanation of a path or command")
+    print()
+    tip("Add --help after any command for more details")
+    tip("A conversational AI agent version is planned for a later release")
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="fsmentor",
+        description="File System Mentor – learn the Linux filesystem & Debian packages",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              fsmentor                     # friendly overview
+              fsmentor fhs
+              fsmentor path /etc
+              fsmentor cmd python3
+              fsmentor pkg nginx
+              fsmentor install htop
+              fsmentor search editor
+              fsmentor owner /usr/bin/ls
+              fsmentor why /var/log
+
+            Note: A conversational AI agent version is planned.
+                  This CLI stays fast, local, and zero-dependency.
+        """),
+    )
+    sub = parser.add_subparsers(dest="command", required=False)
+
+    # fhs
+    p_fhs = sub.add_parser("fhs", help="Explain the Filesystem Hierarchy Standard")
+    p_fhs.set_defaults(func=cmd_fhs)
+
+    # path
+    p_path = sub.add_parser("path", help="Explain a filesystem path")
+    p_path.add_argument("path", help="Absolute or relative path, or a command name")
+    p_path.set_defaults(func=cmd_path)
+
+    # cmd
+    p_cmd = sub.add_parser("cmd", help="Explain a command / binary (enhanced which)")
+    p_cmd.add_argument("name", help="Command name")
+    p_cmd.set_defaults(func=cmd_cmd)
+
+    # pkg
+    p_pkg = sub.add_parser("pkg", help="Explain a Debian package")
+    p_pkg.add_argument("package", help="Package name")
+    p_pkg.set_defaults(func=cmd_pkg)
+
+    # install
+    p_inst = sub.add_parser("install", help="Explain a package then optionally install it")
+    p_inst.add_argument("package", help="Package name")
+    p_inst.add_argument("-y", "--yes", action="store_true", help="Assume yes and install")
+    p_inst.set_defaults(func=cmd_install)
+
+    # search
+    p_search = sub.add_parser("search", help="Search packages by name")
+    p_search.add_argument("query", help="Search term")
+    p_search.set_defaults(func=cmd_search)
+
+    # owner (new)
+    p_owner = sub.add_parser("owner", help="Which package owns this file?")
+    p_owner.add_argument("file", help="File path or command name")
+    p_owner.set_defaults(func=cmd_owner)
+
+    # why (friendly alias)
+    p_why = sub.add_parser("why", help="Quick explanation of a path or command")
+    p_why.add_argument("target", help="Path or command name")
+    p_why.set_defaults(func=cmd_why)
+
+    args = parser.parse_args()
+
+    if not args.command:
+        show_welcome()
+        return
+
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
